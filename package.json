@@ -1,0 +1,20 @@
+{
+  "name": "magazine-core",
+  "version": "11.9.0",
+  "private": true,
+  "type": "module",
+  "description": "Magazine Core — vivid ultralight Microsoft ecosystem magazine",
+  "scripts": {
+    "build": "npm run verify && npm run smoke",
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "verify": "npm run check && node scripts/verify.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "check": "node --check src/server.mjs && node --check src/render.mjs && node --check src/news-worker.mjs && node --check src/feed-parser.mjs && node --check src/utils.mjs && node --check scripts/verify.mjs && node --check scripts/smoke.mjs && node --check scripts/news-status.mjs",
+    "news:status": "node scripts/news-status.mjs"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

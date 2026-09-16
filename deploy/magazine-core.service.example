@@ -1,0 +1,22 @@
+[Unit]
+Description=Magazine Core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/magazine-core
+Environment=NODE_ENV=production
+EnvironmentFile=-/opt/magazine-core/.env
+ExecStart=/usr/bin/node /opt/magazine-core/src/server.mjs
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+KillSignal=SIGTERM
+
+# Basic hardening that does not prevent the local cache from working.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
