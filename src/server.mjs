@@ -1,3 +1,17 @@
+// =============================================================================
+// Magazine Core — HTTP server
+// -----------------------------------------------------------------------------
+// The server is deliberately thin. It loads cached news into memory, serves
+// static assets, and hands every HTML request to the render layer.
+//
+// The only access-control-related change compared to the original server:
+//   1. `pingDb()` is awaited before `listen`, so the site refuses to start
+//      if MySQL is unreachable.
+//   2. The request handler is async so it can await the render layer.
+//   3. `renderCached()` skips the HTML cache for requests carrying an
+//      X-Document-Id header, because those may produce a banned page.
+// =============================================================================
+
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
@@ -8,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { fallbackNews } from './data/fallbackNews.js';
 import { sources } from './data/sources.js';
 import { renderRoute } from './render.mjs';
+import { pingDb } from './db.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const publicDir = path.join(root, 'public');
@@ -140,13 +155,20 @@ function serveStatic(req, res, pathname) {
   return true;
 }
 
-function renderCached(url) {
+// Render with a small in-memory cache.
+// Caching is skipped for any request carrying an X-Document-Id header,
+// because those may produce a banned page that must not be shared.
+async function renderCached(url, stateForRender, req) {
+  const isAnon = !req?.headers?.['x-document-id'];
   const key = `${url.pathname}${url.search}`;
   const current = htmlCache.get(key);
   const now = Date.now();
-  if (current && now - current.createdAt < 30_000) return current.result;
-  const result = renderRoute(url, state);
-  if (result.status === 200) {
+
+  if (isAnon && current && now - current.createdAt < 30_000) return current.result;
+
+  const result = await renderRoute(url, stateForRender, req);
+
+  if (isAnon && result.status === 200) {
     if (htmlCache.size >= 160) htmlCache.delete(htmlCache.keys().next().value);
     htmlCache.set(key, { result, createdAt: now });
   }
@@ -248,7 +270,16 @@ function healthJson() {
 
 await Promise.all([loadCache(), preloadPublicAssets()]);
 
-const server = http.createServer((req, res) => {
+// Fail fast if the access layer cannot reach MySQL.
+try {
+  await pingDb();
+  console.log('[db] MySQL connection OK');
+} catch (error) {
+  console.error(`[db] MySQL connection failed: ${error.message}`);
+  process.exit(1);
+}
+
+const server = http.createServer(async (req, res) => {
   const startedAt = process.hrtime.bigint();
   try {
     if (!['GET', 'HEAD'].includes(req.method || '')) {
@@ -277,7 +308,7 @@ const server = http.createServer((req, res) => {
     }
     if (serveStatic(req, res, pathname)) return;
 
-    const result = renderCached(url);
+    const result = await renderCached(url, state, req);
     const elapsedBeforeSend = Number(process.hrtime.bigint() - startedAt) / 1e6;
     send(res, result.status, result.html, {
       'Content-Type': 'text/html; charset=utf-8',
