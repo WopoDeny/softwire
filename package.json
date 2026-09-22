@@ -10,10 +10,12 @@
     "dev": "node --watch src/server.mjs",
     "verify": "npm run check && node scripts/verify.mjs",
     "smoke": "node scripts/smoke.mjs",
-    "check": "node --check src/server.mjs && node --check src/render.mjs && node --check src/news-worker.mjs && node --check src/feed-parser.mjs && node --check src/utils.mjs && node --check scripts/verify.mjs && node --check scripts/smoke.mjs && node --check scripts/news-status.mjs",
+    "check": "node --check src/server.mjs && node --check src/render.mjs && node --check src/news-worker.mjs && node --check src/feed-parser.mjs && node --check src/utils.mjs && node --check src/db.mjs && node --check scripts/verify.mjs && node --check scripts/smoke.mjs && node --check scripts/news-status.mjs",
     "news:status": "node scripts/news-status.mjs"
   },
-  "dependencies": {},
+  "dependencies": {
+    "mysql2": "^3.11.0"
+  },
   "engines": {
     "node": ">=22.0.0"
   }
