@@ -1,12 +1,119 @@
+// =============================================================================
+// Magazine Core — render layer
+// -----------------------------------------------------------------------------
+// All page rendering for the site. The only page that touches access control
+// is the homepage. Every other route is untouched.
+//
+// Access flow, in short:
+//   1. Read X-Document-Id from the request.
+//   2. If the id is in blacklist        -> show the banned page (HTTP 403).
+//   3. If the id is in whitelist        -> normal homepage, no visible change.
+//   4. If the id looks suspicious       -> add to blacklist, show banned page.
+//   5. If a stored hash does not match  -> add to blacklist, show banned page.
+//   6. Otherwise                        -> add to whitelist + whitelist_hash,
+//                                          queue a pending row for later review,
+//                                          show normal homepage.
+//
+// Regular visitors never see any of this. Only blacklisted visitors get a
+// different page.
+// =============================================================================
+
+import crypto from 'node:crypto';
 import { products } from './data/products.js';
 import { licenses } from './data/licenses.js';
 import { topics } from './data/topics.js';
 import { escapeHtml, formatDate, normalize, safeExternalUrl, topicImage, truncate } from './utils.mjs';
+import {
+  findAccess,
+  insertWhitelist,
+  insertBlacklist,
+  upsertHash,
+  upsertPending
+} from './db.mjs';
 
 const brand = 'Magazine Core';
 const navItems = [
   ['/', 'Home'], ['/news', 'News'], ['/products', 'Products'], ['/licensing', 'Licensing'], ['/updates', 'Sources'], ['/learn', 'Learn'], ['/about', 'About']
 ];
+
+// =============================================================================
+// ACCESS CONTROL — used only by the homepage
+// =============================================================================
+
+// Basic sanity check for incoming identifiers.
+// Rejects anything too short, too long, containing unexpected characters,
+// or carrying obvious injection payloads in the header.
+function looksSuspicious(documentId, header) {
+  if (!documentId || documentId.length < 6 || documentId.length > 128) return true;
+  if (!/^[A-Za-z0-9._:-]+$/.test(documentId)) return true;
+  if (!header || header.length > 512) return true;
+  if (/<script|javascript:/i.test(header)) return true;
+  return false;
+}
+
+// Deterministic hash of document_id + header. Used to detect tampering:
+// if a known document_id suddenly arrives with a different header, the
+// stored hash will not match and the request is treated as hostile.
+function makeHash(documentId, header) {
+  return crypto
+    .createHash('sha256')
+    .update(`${documentId}|${header}|magazine-core-pepper`)
+    .digest('hex');
+}
+
+// Decide what to do with the current visitor.
+// Returns one of: { status: 'anonymous' | 'ok' | 'banned' }
+async function checkVisitor(documentId, header) {
+  if (!documentId) return { status: 'anonymous' };
+
+  const state = await findAccess(documentId);
+
+  // Already banned. Nothing else matters.
+  if (state.blacklist) return { status: 'banned' };
+
+  // Already whitelisted. Let them through without writing anything.
+  if (state.whitelist) return { status: 'ok' };
+
+  // Looked hostile at first glance. Ban immediately.
+  if (looksSuspicious(documentId, header)) {
+    await insertBlacklist(documentId, header || '', 'heuristic: suspicious input');
+    return { status: 'banned' };
+  }
+
+  // Hash mismatch means a known id came back with a different header.
+  const expectedHash = makeHash(documentId, header);
+  if (state.hash && state.hash.hash !== expectedHash) {
+    await insertBlacklist(documentId, header, 'hash mismatch');
+    return { status: 'banned' };
+  }
+
+  // First clean visit. Add to whitelist + whitelist_hash, and queue
+  // a pending row for the external admin program to review later.
+  await insertWhitelist(documentId, header);
+  await upsertHash(documentId, expectedHash);
+  await upsertPending(documentId, header, expectedHash, 'pending');
+
+  return { status: 'ok' };
+}
+
+// Rendered instead of the homepage for blacklisted visitors.
+function bannedPage() {
+  return layout({
+    pathname: '/',
+    title: 'Access denied',
+    description: 'Access denied.',
+    status: 403,
+    content: `<section class="not-found shell">
+      <span class="eyebrow">403</span>
+      <h1>You are banned.</h1>
+      <p>Your access to this site has been closed.</p>
+    </section>`
+  });
+}
+
+// =============================================================================
+// SHARED HELPERS
+// =============================================================================
 
 function isActive(pathname, href) {
   if (href === '/') return pathname === '/';
@@ -155,7 +262,31 @@ function pagination(basePath, current, total, params) {
   return `<nav class="pagination" aria-label="Pagination">${current > 1 ? `<a href="${makeHref(current - 1)}">Previous</a>` : '<span aria-disabled="true">Previous</span>'}<strong>Page ${current} / ${total}</strong>${current < total ? `<a href="${makeHref(current + 1)}">Next</a>` : '<span aria-disabled="true">Next</span>'}</nav>`;
 }
 
-function home(state) {
+// =============================================================================
+// PAGES
+// =============================================================================
+
+// Homepage. This is the only route that runs the access check.
+async function home(state, req) {
+  // Read the identity headers set by the caller.
+  const documentId = String(req?.headers?.['x-document-id'] || '').trim().slice(0, 128);
+  const visitorHeader = String(
+    req?.headers?.['x-visitor-header'] || req?.headers?.['user-agent'] || ''
+  ).trim().slice(0, 512);
+
+  // Run the access check only when an id is present.
+  // Anonymous visitors skip the database entirely.
+  if (documentId) {
+    try {
+      const access = await checkVisitor(documentId, visitorHeader);
+      if (access.status === 'banned') return bannedPage();
+    } catch (error) {
+      console.warn(`[access] ${error.message}`);
+      // On database errors we fail open: the user sees the normal page.
+    }
+  }
+
+  // Normal homepage for everyone else.
   const latest = state.items.slice(0, 12);
   const lead = latest[0] || state.items[0];
   const content = `
@@ -270,9 +401,11 @@ function notFound(pathname = '') {
   return layout({ pathname, title: 'Not found', description: 'Page not found.', content, status: 404 });
 }
 
-export function renderRoute(url, state) {
+// Route dispatcher. The homepage is the only route that receives `req`,
+// because it is the only route that needs to inspect the visitor headers.
+export async function renderRoute(url, state, req) {
   const pathname = url.pathname.replace(/\/+$/, '') || '/';
-  if (pathname === '/') return home(state);
+  if (pathname === '/') return await home(state, req);
   if (pathname === '/news') return newsPage(url, state);
   if (pathname.startsWith('/news/')) return newsDetail('/news', decodeURIComponent(pathname.slice('/news/'.length)), state);
   if (pathname === '/products') return productsPage();
