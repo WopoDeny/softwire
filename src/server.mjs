@@ -370,3 +370,264 @@ async function shutdown(signal) {
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+This document explains the access-control layer that runs on the homepage
+of Magazine Core. It is deliberately small: two files, one database, no
+client-side JavaScript, no banners for regular visitors.
+
+---
+
+## 1. What this does
+
+When a user opens the homepage and carries an `X-Document-Id` header, the
+site decides what kind of visitor they are:
+
+| Visitor state | What happens |
+|---|---|
+| **Blacklisted** | They see a 403 "You are banned" page. Nothing else. |
+| **Whitelisted** | They see the normal homepage. No indicators, no banners. |
+| **Unknown / first time, clean** | Added to `whitelist` and `whitelist_hash`, queued in `pending`, sees the normal homepage. |
+| **Unknown / first time, suspicious** | Added directly to `blacklist`, sees the 403 banned page. |
+
+The user is never told which bucket they fell into. The only visible
+difference is the banned page for blacklisted visitors.
+
+---
+
+## 2. Files involved
+
+| File | Purpose |
+|---|---|
+| `src/db.mjs` | MySQL connection pool and all SQL queries for the four access tables. No business logic. |
+| `src/render.mjs` | The homepage function `home()`. It reads the headers, calls into `db.mjs`, and decides whether to show the banned page or the normal homepage. |
+| `src/server.mjs` | Imports `pingDb`, calls it before `listen`, makes the request handler async, and skips the HTML cache for requests with `X-Document-Id`. |
+
+Everything related to access control lives in exactly two files:
+`src/db.mjs` (data) and `src/render.mjs` (decisions). `src/server.mjs`
+does not know anything about access control beyond the fact that the
+render function is now async.
+
+---
+
+## 3. Database setup
+
+Create a MySQL database and run the following SQL once.
+
+```sql
+CREATE DATABASE IF NOT EXISTS magazine_core
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+USE magazine_core;
+
+CREATE TABLE IF NOT EXISTS whitelist (
+  document_id VARCHAR(128) PRIMARY KEY,
+  header      VARCHAR(512) NOT NULL,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS blacklist (
+  document_id VARCHAR(128) PRIMARY KEY,
+  header      VARCHAR(512) NOT NULL,
+  reason      VARCHAR(255) NULL,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS whitelist_hash (
+  document_id VARCHAR(128) PRIMARY KEY,
+  hash        CHAR(64) NOT NULL,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS pending (
+  document_id VARCHAR(128) PRIMARY KEY,
+  header      VARCHAR(512) NOT NULL,
+  hash        CHAR(64) NOT NULL,
+  status      ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  reviewed_at DATETIME NULL,
+  INDEX idx_status_created (status, created_at)
+) ENGINE=InnoDB;
+```
+
+---
+
+## 4. Environment variables
+
+Add these to your `.env` file. The server loads `.env` automatically at startup.
+
+```env
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=root
+DB_PASSWORD=
+DB_NAME=magazine_core
+DB_POOL=10
+```
+
+If any of these are missing, sensible defaults are used. The only one
+you must set in practice is `DB_PASSWORD` and possibly `DB_NAME`.
+
+---
+
+## 5. How a visitor is identified
+
+The homepage reads two request headers:
+
+- `X-Document-Id` — the unique identifier of the document that opened the site.
+- `X-Visitor-Header` — an additional string sent by the caller. If it is
+  not present, the standard `User-Agent` header is used instead.
+
+If `X-Document-Id` is missing, the request is treated as anonymous and the
+database is never touched. This keeps the site fast for regular web traffic.
+
+---
+
+## 6. Decision flow inside `home()`
+
+```
+Request arrives at /
+        │
+        ▼
+Is X-Document-Id present?
+        │
+   no ──┴── yes
+   │          │
+   │          ▼
+   │   Look up the id in all four tables
+   │          │
+   │          ▼
+   │   In blacklist? ── yes ──► 403 banned page
+   │          │
+   │          ▼
+   │   In whitelist? ── yes ──► normal homepage
+   │          │
+   │          ▼
+   │   Looks suspicious? ── yes ──► add to blacklist, 403 banned page
+   │          │
+   │          ▼
+   │   Stored hash mismatch? ── yes ──► add to blacklist, 403 banned page
+   │          │
+   │          ▼
+   │   Add to whitelist + whitelist_hash
+   │   Add to pending with status = 'pending'
+   │          │
+   │          ▼
+   │   normal homepage
+   │
+   ▼
+normal homepage
+```
+
+The two criteria that decide "suspicious" are defined in
+`looksSuspicious()`. They can be extended freely without touching any
+other part of the system.
+
+---
+
+## 7. The four tables
+
+### `whitelist`
+
+Every clean first-time visitor is written here. If they come back, they
+are served the normal homepage directly and no new rows are written.
+
+### `blacklist`
+
+Any visitor that trips the heuristic, produces a hash mismatch, or is
+rejected by you ends up here. From then on, every request from that
+`document_id` returns a 403 banned page.
+
+### `whitelist_hash`
+
+Stores a SHA-256 hash of `document_id` + header + a static pepper. Its
+only job is to detect a subtle case: a known `document_id` showing up
+with a different header than before. That usually means someone is
+trying to reuse an old identifier, so the id is moved to the blacklist.
+
+### `pending`
+
+A queue of whitelisted users that have not yet been approved by you.
+You read this table from your external admin program, decide what to do
+with each row, and call `approve()` or `reject()`.
+
+---
+
+## 8. Approving and rejecting from your admin program
+
+Import the two exported functions from `src/db.mjs`:
+
+```js
+import { approve, reject } from './src/db.mjs';
+
+// Approve a user. Moves them fully into whitelist and marks the pending
+// row as approved. This is the step after which you push your program
+// to that user.
+await approve('user-abc-123');
+
+// Reject a user. Moves them into blacklist and marks the pending row
+// as rejected. They will see the banned page on their next request.
+await reject('user-abc-123', 'rejected by admin');
+```
+
+Both functions return `true` if a matching pending row existed and was
+processed, and `false` otherwise.
+
+---
+
+## 9. Running the server
+
+```bash
+npm install          # installs mysql2
+npm start            # starts the server on port 3000
+```
+
+On startup you should see:
+
+```
+[db] MySQL connection OK
+[web] Magazine Core 11.9 listening on http://0.0.0.0:3000
+```
+
+If MySQL is unreachable, the process exits with a clear error. This is
+intentional: the site should not start if the access layer cannot work.
+
+---
+
+## 10. Testing manually
+
+```bash
+# Anonymous visitor — normal homepage, no database activity
+curl http://localhost:3000/
+
+# Clean first-time visitor — written to whitelist, whitelist_hash, pending
+curl -H "X-Document-Id: user-abc-123" http://localhost:3000/
+
+# Banned visitor — 403, banned page
+curl -H "X-Document-Id: <script>alert(1)</script>" http://localhost:3000/
+
+# After approving user-abc-123 from your admin program, this returns
+# the normal homepage again
+curl -H "X-Document-Id: user-abc-123" http://localhost:3000/
+```
+
+---
+
+## 11. Notes on caching
+
+`src/server.mjs` skips the in-memory HTML cache for any request that
+carries an `X-Document-Id`. This guarantees that a banned response is
+never accidentally served to a regular visitor, and that a whitelisted
+visitor never receives a cached anonymous page. Anonymous requests are
+cached for 30 seconds as before.
+
+---
+
+## 12. What is intentionally not included
+
+- No client-side JavaScript. Everything is decided on the server.
+- No user-visible status. Whitelisted and pending visitors see exactly
+  the same homepage as anonymous visitors.
+- No admin UI on the site. Approval and rejection happen in your external
+  program, which imports `approve()` and `reject()` from `src/db.mjs`.
+- No rate limiting, no IP bans, no captcha. Those can be added later on
+  top of the same four tables without touching the homepage logic.
